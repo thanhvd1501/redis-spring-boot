@@ -1,0 +1,309 @@
+## 📒 **PHẦN 4: RedisTemplate và Serialization chi tiết – JSON, String, JDK, Custom Serializer**
+
+### 🎯 **Mục tiêu học phần**
+
+Sau phần này, bạn sẽ:
+
+1. Hiểu rõ cách Redis lưu trữ dữ liệu trong Spring Boot qua **serializer**.
+2. Phân biệt các loại **serializer** (JDK, String, JSON, GenericJackson2Json).
+3. Biết cách **tùy chỉnh serializer** để dễ debug và tăng hiệu năng.
+4. Thực hành: serialize/deserialize `User` object qua RedisTemplate.
+5. Biết debug khi lỗi “Cannot deserialize object” hoặc “Unreadable value”.
+
+---
+
+## 🧠 1. RedisTemplate là gì?
+
+`RedisTemplate` là **lớp trung gian (client)** giúp bạn thao tác với Redis trong Spring Boot:
+
+* CRUD (Value, Hash, List, Set, SortedSet)
+* Transaction
+* Pub/Sub
+* TTL
+
+Nó **không lưu dữ liệu trực tiếp** — mà **chuyển đổi (serialize)** dữ liệu trước khi gửi qua Redis.
+Vì Redis chỉ lưu **byte[]**, nên mọi thứ (String, Object, JSON) đều phải serialize.
+
+---
+
+## 🔍 2. Kiến trúc hoạt động của RedisTemplate
+
+```
+[Object Java]
+     ↓  (Serializer)
+[byte[] gửi đi]
+     ↓
+[Redis Server]
+     ↓
+[byte[] trả về]
+     ↓  (Deserializer)
+[Object Java]
+```
+
+### 🔸 ASCII Flow:
+
+```
+   save(User)
+     │
+     ▼
+[RedisTemplate]
+     │
+     ▼
+[StringRedisSerializer] → key = "user:1"
+[Jackson2JsonSerializer] → value = JSON(User)
+     │
+     ▼
+[Redis Server lưu key:value]
+```
+
+---
+
+## 🧩 3. Các loại Serializer phổ biến
+
+| Serializer                             | Mô tả                                           | Ưu điểm                 | Nhược điểm                                           |
+| -------------------------------------- | ----------------------------------------------- | ----------------------- | ---------------------------------------------------- |
+| **JdkSerializationRedisSerializer**    | Dùng cơ chế `Serializable` của Java             | Không cần thêm thư viện | Khó debug (nhị phân), không tương thích giữa version |
+| **StringRedisSerializer**              | Chuyển `String` → `byte[]`                      | Đơn giản, dễ đọc        | Chỉ dùng cho chuỗi                                   |
+| **GenericJackson2JsonRedisSerializer** | Serialize object → JSON (tự động thêm `@class`) | Dễ debug, an toàn       | Tốn chút dung lượng do thêm metadata                 |
+| **Jackson2JsonRedisSerializer**        | Serialize nhanh, nhưng cần khai báo type cụ thể | Hiệu năng cao           | Dễ lỗi nếu không set type                            |
+
+> 💡 **Khuyến nghị:** Dùng `GenericJackson2JsonRedisSerializer` cho hầu hết các use case — vì nó lưu JSON **và có metadata để deserialize chính xác**.
+
+---
+
+## ⚙️ 4. Cấu hình RedisTemplate với serializer chuẩn
+
+```java
+package com.example.redis.config;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.serializer.*;
+
+@Configuration
+public class RedisConfig {
+
+    @Bean
+    public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory connectionFactory) {
+
+        RedisTemplate<String, Object> template = new RedisTemplate<>();
+        template.setConnectionFactory(connectionFactory);
+
+        // ✅ Key là chuỗi dễ đọc
+        template.setKeySerializer(new StringRedisSerializer());
+
+        // ✅ Value: JSON an toàn (tự thêm @class metadata)
+        ObjectMapper mapper = new ObjectMapper();
+        mapper.activateDefaultTyping(
+                BasicPolymorphicTypeValidator.builder().allowIfBaseType(Object.class).build(),
+                ObjectMapper.DefaultTyping.EVERYTHING
+        );
+
+        GenericJackson2JsonRedisSerializer serializer =
+                new GenericJackson2JsonRedisSerializer(mapper);
+
+        template.setValueSerializer(serializer);
+        template.setHashKeySerializer(new StringRedisSerializer());
+        template.setHashValueSerializer(serializer);
+
+        template.afterPropertiesSet();
+        return template;
+    }
+}
+```
+
+---
+
+## 💾 5. Demo: Serialize Object sang Redis
+
+### 📁 Model
+
+```java
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class Product {
+    private String id;
+    private String name;
+    private double price;
+}
+```
+
+### 📂 Service
+
+```java
+@Service
+@RequiredArgsConstructor
+public class ProductRedisService {
+
+    private final RedisTemplate<String, Object> redisTemplate;
+    private static final String PREFIX = "product:";
+
+    public void save(Product product) {
+        redisTemplate.opsForValue().set(PREFIX + product.getId(), product);
+    }
+
+    public Product findById(String id) {
+        return (Product) redisTemplate.opsForValue().get(PREFIX + id);
+    }
+}
+```
+
+---
+
+### 📡 Controller
+
+```java
+@RestController
+@RequestMapping("/products")
+@RequiredArgsConstructor
+public class ProductController {
+
+    private final ProductRedisService service;
+
+    @PostMapping
+    public String save(@RequestBody Product product) {
+        service.save(product);
+        return "Saved product to Redis!";
+    }
+
+    @GetMapping("/{id}")
+    public Product get(@PathVariable String id) {
+        return service.findById(id);
+    }
+}
+```
+
+---
+
+### 🧪 Test với curl
+
+```bash
+curl -X POST http://localhost:8080/products \
+-H "Content-Type: application/json" \
+-d '{"id":"101","name":"MacBook Air","price":999.99}'
+```
+
+```bash
+curl http://localhost:8080/products/101
+```
+
+---
+
+### 🧩 Kết quả trong Redis CLI
+
+```bash
+127.0.0.1:6379> keys *
+"product:101"
+
+127.0.0.1:6379> get product:101
+"{\"@class\":\"com.example.redis.model.Product\",\"id\":\"101\",\"name\":\"MacBook Air\",\"price\":999.99}"
+```
+
+➡️ Redis lưu JSON dễ đọc, có `@class` → giúp Spring Boot biết class nào cần deserialize khi đọc lại.
+
+---
+
+## 🧪 6. Tuỳ chỉnh Serializer riêng cho từng loại dữ liệu
+
+Bạn có thể tạo nhiều RedisTemplate khác nhau cho từng domain:
+
+```java
+@Bean
+public RedisTemplate<String, String> stringTemplate(RedisConnectionFactory factory) {
+    RedisTemplate<String, String> template = new RedisTemplate<>();
+    template.setConnectionFactory(factory);
+    template.setKeySerializer(new StringRedisSerializer());
+    template.setValueSerializer(new StringRedisSerializer());
+    return template;
+}
+```
+
+Hoặc riêng cho kiểu cụ thể:
+
+```java
+@Bean
+public RedisTemplate<String, Product> productTemplate(RedisConnectionFactory factory) {
+    RedisTemplate<String, Product> template = new RedisTemplate<>();
+    template.setConnectionFactory(factory);
+    template.setKeySerializer(new StringRedisSerializer());
+    template.setValueSerializer(new Jackson2JsonRedisSerializer<>(Product.class));
+    return template;
+}
+```
+
+---
+
+## 🧠 7. Khi nào dùng Serializer nào?
+
+| Use Case                                | Serializer khuyên dùng               |
+| --------------------------------------- | ------------------------------------ |
+| Cache Object (User, Product...)         | `GenericJackson2JsonRedisSerializer` |
+| Lưu chuỗi đơn giản                      | `StringRedisSerializer`              |
+| Lưu kiểu primitive (counter, flag)      | `StringRedisSerializer`              |
+| Khi tốc độ cực quan trọng, type cố định | `Jackson2JsonRedisSerializer<T>`     |
+| Khi lưu binary, object phức tạp         | `JdkSerializationRedisSerializer`    |
+
+---
+
+## 🧩 8. Debug lỗi thường gặp
+
+| Lỗi                        | Nguyên nhân                                | Cách xử lý                                                |
+| -------------------------- | ------------------------------------------ | --------------------------------------------------------- |
+| ❌ `Could not deserialize`  | Thay đổi class, khác serializer            | Xóa key cũ hoặc dùng `GenericJackson2JsonRedisSerializer` |
+| ❌ Redis hiển thị nhị phân  | Dùng JDK serializer                        | Đổi sang JSON serializer                                  |
+| ❌ `ClassNotFoundException` | Key chứa `@class` nhưng app thiếu class đó | Kiểm tra package / version                                |
+| ❌ “null return”            | Value bị null hoặc serializer mismatch     | Kiểm tra key serializer                                   |
+
+---
+
+## 🧮 9. Bài tập nhỏ
+
+**Bài 1:**
+Tạo `OrderRedisService` lưu `Order` object (id, total, createdAt).
+Cấu hình RedisTemplate riêng với `Jackson2JsonRedisSerializer<Order>`.
+
+**Bài 2:**
+Thử thay `GenericJackson2JsonRedisSerializer` bằng `JdkSerializationRedisSerializer`
+→ Quan sát sự khác biệt khi xem dữ liệu trong `redis-cli`.
+
+**Bài 3:**
+Thử serialize object lồng nhau (User chứa List<Order>) → xem có deserialize lại được không.
+
+---
+
+## ⚠️ 10. Sai lầm phổ biến
+
+| Sai lầm                               | Hậu quả                                          |
+| ------------------------------------- | ------------------------------------------------ |
+| Dùng JDK serializer mặc định          | Redis hiển thị nhị phân, khó debug.              |
+| Không cấu hình hash serializer        | Khi lưu Hash (HSET) bị lỗi hoặc deserialize sai. |
+| Dùng 1 RedisTemplate cho nhiều domain | Gây lỗi class mismatch.                          |
+| Đổi class mà không xóa cache cũ       | Lỗi deserialize do `@class` metadata cũ.         |
+| Không kiểm tra encoding               | UTF-8 mismatch → lỗi tiếng Việt.                 |
+
+---
+
+## 🌟 11. Best Practices
+
+✅ Dùng `GenericJackson2JsonRedisSerializer` cho mọi object.
+✅ Mỗi domain có thể có RedisTemplate riêng.
+✅ Dùng key prefix (`user:`, `product:`).
+✅ Khi thay đổi model → nên flush cache.
+✅ Kiểm tra bằng RedisInsight để xem JSON structure.
+✅ Đặt TTL khi lưu thủ công bằng `opsForValue().set(key, value, Duration.ofMinutes(n))`.
+
+---
+
+## 🎓 Kết luận
+
+Bạn đã hiểu:
+
+* Cách hoạt động của RedisTemplate và serializer
+* Khi nào dùng JSON, String, JDK serialization
+* Cách debug và tránh lỗi deserialize
+* Cách tuỳ chỉnh RedisTemplate theo domain
